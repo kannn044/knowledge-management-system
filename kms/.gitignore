@@ -1,0 +1,42 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Node
+node_modules/
+dist/
+build/
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Uploads (runtime data)
+uploads/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker
+.docker/
+
+# Prisma
+backend/prisma/migrations/
+
+# Frontend build
+frontend/dist/

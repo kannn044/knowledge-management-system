@@ -1,0 +1,151 @@
+version: '3.9'
+
+services:
+  # ─── PostgreSQL 16 ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: kms_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kms_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kms_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kms_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kms_user} -d ${POSTGRES_DB:-kms_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── ChromaDB Vector Store ────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: kms_chromadb
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis (BullMQ job queue) ─────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: kms_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-kms_redis_pass}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-kms_redis_pass}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Python FastAPI Microservice ──────────────────────────────────
+  python-service:
+    build:
+      context: ./python-service
+      dockerfile: Dockerfile
+    container_name: kms_python
+    restart: unless-stopped
+    environment:
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      NODE_CALLBACK_URL: ${NODE_CALLBACK_URL:-http://host.docker.internal:3001/api/internal/callback}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:-internal_secret_change_me}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8002:8000"
+    volumes:
+      - uploads_data:/app/uploads:ro
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─── Node.js / Express Backend ────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: kms_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kms_user}:${POSTGRES_PASSWORD:-kms_password}@postgres:5432/${POSTGRES_DB:-kms_db}
+      JWT_SECRET: ${JWT_SECRET:-change_me_in_production_supersecret}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change_me_refresh_supersecret}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-kms_redis_pass}@redis:6379
+      PYTHON_SERVICE_URL: http://python-service:8000
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      EMAILJS_SERVICE_ID: ${EMAILJS_SERVICE_ID}
+      EMAILJS_TEMPLATE_ID_VERIFY: ${EMAILJS_TEMPLATE_ID_VERIFY}
+      EMAILJS_TEMPLATE_ID_APPROVE: ${EMAILJS_TEMPLATE_ID_APPROVE}
+      EMAILJS_TEMPLATE_ID_RESET: ${EMAILJS_TEMPLATE_ID_RESET}
+      EMAILJS_PUBLIC_KEY: ${EMAILJS_PUBLIC_KEY}
+      EMAILJS_PRIVATE_KEY: ${EMAILJS_PRIVATE_KEY}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_CALLBACK_URL: ${GOOGLE_CALLBACK_URL:-http://localhost:3001/api/auth/google/callback}
+      UPLOAD_DIR: /app/uploads
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-50}
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      python-service:
+        condition: service_healthy
+    command: npm run dev
+
+  # ─── React Frontend (dev server) ──────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: kms_frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
+      VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  chroma_data:
+  redis_data:
+  uploads_data:

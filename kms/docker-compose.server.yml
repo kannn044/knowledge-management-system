@@ -1,0 +1,78 @@
+# ════════════════════════════════════════════════════════════════════
+# KMS — Server override for poc.mogh.go.th
+#
+# Layered on top of docker-compose.yml + docker-compose.prod.yml.
+# The host Nginx (port 443) already handles SSL — KMS nginx container
+# is disabled. Frontend is served as static files by the host Nginx.
+# Non-conflicting ports are used so existing apps keep running.
+#
+# Usage:
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.server.yml \
+#     up -d postgres chromadb redis python-service backend
+# ════════════════════════════════════════════════════════════════════
+
+services:
+  # ─── PostgreSQL ───────────────────────────────────────────────────
+  # Host port 5433 avoids conflict with any local Postgres on 5432
+  postgres:
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  # ─── ChromaDB ────────────────────────────────────────────────────
+  # Internal only — already cleared in docker-compose.prod.yml
+  chromadb:
+    ports: []
+
+  # ─── Redis ───────────────────────────────────────────────────────
+  # Internal only — already cleared in docker-compose.prod.yml
+  redis:
+    ports: []
+
+  # ─── Python FastAPI ───────────────────────────────────────────────
+  # Internal only — accessed by backend over Docker network
+  python-service:
+    ports: []
+    environment:
+      # backend is still reachable at its Docker-internal address
+      NODE_CALLBACK_URL: http://backend:3001/api/internal/callback
+
+  # ─── Node.js Backend ─────────────────────────────────────────────
+  # Host port 3100 — port 3001 is occupied by MTB Cluster on this server
+  backend:
+    build:
+      target: production
+    environment:
+      NODE_ENV: production
+      # CORS: browser origin is the domain only (no subpath)
+      FRONTEND_URL: https://poc.mogh.go.th
+      # Google OAuth callback must match the registered redirect URI
+      GOOGLE_CALLBACK_URL: https://poc.mogh.go.th/kms/api/auth/google/callback
+    ports:
+      - "127.0.0.1:3100:3001"
+    volumes:
+      - uploads_data:/app/uploads
+    # No source-code mount in production
+    command: node dist/app.js
+
+  # ─── Frontend ────────────────────────────────────────────────────
+  # Not run as a container on this server.
+  # Build the static files and copy dist/ to the host path that Nginx serves.
+  # See deployment steps in .env.server.example.
+  frontend:
+    profiles:
+      - manual
+
+  # ─── Nginx container ─────────────────────────────────────────────
+  # Disabled — the host Nginx on this server handles SSL + routing.
+  nginx:
+    profiles:
+      - manual
+
+volumes:
+  postgres_data:
+  chroma_data:
+  redis_data:
+  uploads_data:
