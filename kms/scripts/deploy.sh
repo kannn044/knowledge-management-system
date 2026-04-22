@@ -1,152 +1,226 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════
-# KMS — Linux Server Deployment Script
-# Run on your Linux server (Ubuntu 22.04 / Debian 12 recommended)
+# KMS — Deployment Script (RHEL / CentOS / Rocky Linux)
 #
-# Usage:
+# Designed for a server that already runs Nginx + wildcard SSL and
+# hosts other apps. KMS is deployed under a subpath, e.g. /kms/.
+# The Docker stack runs backend + data services; host Nginx proxies.
+#
+# Usage (from the kms/ directory):
 #   chmod +x scripts/deploy.sh
-#   ./scripts/deploy.sh --domain kms.yourdomain.com --email admin@yourdomain.com
+#   ./scripts/deploy.sh --domain poc.moph.go.th --subpath /kms --static-dir /home/kms/www
+#
+# Flags:
+#   --domain      Host + domain only, no trailing slash  (e.g. poc.moph.go.th)
+#   --subpath     Subpath KMS is served under           (default: /kms)
+#   --static-dir  Where host Nginx serves frontend HTML (default: /home/kms/www)
+#   --skip-docker Skip Docker rebuild (re-deploy frontend/nginx only)
 # ════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
 DOMAIN=""
-EMAIL=""
-REPO_DIR="$(pwd)"
+SUBPATH="/kms"
+STATIC_DIR="/home/kms/www"
+SKIP_DOCKER=false
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ─── Argument parsing ────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --domain) DOMAIN="$2"; shift 2 ;;
-    --email)  EMAIL="$2";  shift 2 ;;
+    --domain)      DOMAIN="$2";      shift 2 ;;
+    --subpath)     SUBPATH="$2";     shift 2 ;;
+    --static-dir)  STATIC_DIR="$2";  shift 2 ;;
+    --skip-docker) SKIP_DOCKER=true; shift   ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
-  echo "Usage: $0 --domain your.domain.com --email admin@domain.com"
+if [[ -z "$DOMAIN" ]]; then
+  echo "Usage: $0 --domain your.domain.com [--subpath /kms] [--static-dir /home/kms/www]"
   exit 1
 fi
 
+# Normalise: subpath must start with / and have no trailing /
+SUBPATH="/${SUBPATH#/}"
+SUBPATH="${SUBPATH%/}"
+BACKEND_PORT=3100   # host port bound by docker-compose.server.yml
+
 echo "════════════════════════════════════════════════════════"
-echo "  KMS Deployment — Domain: $DOMAIN"
+echo "  KMS Deployment"
+echo "  Domain  : $DOMAIN"
+echo "  Subpath : $SUBPATH"
+echo "  Static  : $STATIC_DIR"
 echo "════════════════════════════════════════════════════════"
 
-# ─── 1. System dependencies ───────────────────────────────────────
-echo "[1/8] Installing system dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq \
-  apt-transport-https \
-  ca-certificates \
-  curl \
-  gnupg \
-  lsb-release \
-  nginx \
-  certbot \
-  python3-certbot-nginx \
-  ufw
+# ─── 1. System dependencies ──────────────────────────────────────
+echo "[1/7] Checking system dependencies..."
+
+# Detect package manager — prefer dnf (RHEL 8+), fall back to yum
+if command -v dnf &>/dev/null; then
+  PKG="dnf"
+elif command -v yum &>/dev/null; then
+  PKG="yum"
+else
+  echo "❌ Neither dnf nor yum found. This script supports RHEL/CentOS/Rocky Linux."
+  exit 1
+fi
+
+# Install curl / git if missing (minimal installs may lack them)
+for pkg in curl git; do
+  command -v "$pkg" &>/dev/null || $PKG install -y "$pkg"
+done
 
 # ─── 2. Docker ───────────────────────────────────────────────────
-echo "[2/8] Installing Docker..."
+echo "[2/7] Checking Docker..."
 if ! command -v docker &>/dev/null; then
-  curl -fsSL https://get.docker.com | sudo sh
-  sudo usermod -aG docker "$USER"
-  echo "⚠️  You may need to re-login for Docker group to take effect."
+  echo "  Installing Docker CE..."
+  $PKG install -y yum-utils
+  yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  $PKG install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable --now docker
+  echo "  Docker installed and started."
 fi
 
-if ! command -v docker-compose &>/dev/null; then
-  sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+# docker compose (V2 plugin) OR standalone docker-compose
+if docker compose version &>/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose &>/dev/null; then
+  COMPOSE="docker-compose"
+else
+  echo "  Installing docker-compose standalone..."
+  curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
     -o /usr/local/bin/docker-compose
-  sudo chmod +x /usr/local/bin/docker-compose
+  chmod +x /usr/local/bin/docker-compose
+  COMPOSE="docker-compose"
 fi
+echo "  Using: $COMPOSE"
 
-# ─── 3. Firewall ──────────────────────────────────────────────────
-echo "[3/8] Configuring UFW firewall..."
-sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
-sudo ufw --force enable
-
-# ─── 4. Environment file ──────────────────────────────────────────
-echo "[4/8] Checking .env file..."
-if [[ ! -f "$REPO_DIR/.env" ]]; then
-  echo "❌ .env file not found. Copy .env.example to .env and fill in values."
-  echo "   cp .env.example .env && nano .env"
-  exit 1
+# ─── 3. Node.js + npm (for frontend build) ───────────────────────
+echo "[3/7] Checking Node.js..."
+if ! command -v node &>/dev/null; then
+  echo "  Installing Node.js 20 via NodeSource..."
+  curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+  $PKG install -y nodejs
 fi
+echo "  Node $(node -v) / npm $(npm -v)"
 
-# ─── 5. Nginx domain config ──────────────────────────────────────
-echo "[5/8] Configuring Nginx for $DOMAIN..."
-sudo sed -i "s/kms.yourdomain.com/$DOMAIN/g" "$REPO_DIR/nginx/conf.d/kms.conf"
-
-# Temporary HTTP-only config for Certbot challenge
-sudo tee /etc/nginx/sites-available/kms-temp.conf > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    root /var/www/certbot;
-    location /.well-known/acme-challenge/ { }
-}
-EOF
-sudo ln -sf /etc/nginx/sites-available/kms-temp.conf /etc/nginx/sites-enabled/kms-temp.conf
-sudo nginx -t && sudo systemctl reload nginx
-
-# ─── 6. SSL Certificate ──────────────────────────────────────────
-echo "[6/8] Obtaining SSL certificate from Let's Encrypt..."
-sudo mkdir -p /var/www/certbot
-sudo certbot certonly \
-  --webroot \
-  --webroot-path /var/www/certbot \
-  -d "$DOMAIN" \
-  --email "$EMAIL" \
-  --agree-tos \
-  --non-interactive
-
-# Remove temp nginx config
-sudo rm -f /etc/nginx/sites-enabled/kms-temp.conf
-
-# ─── 7. Build & start Docker services ────────────────────────────
-echo "[7/8] Building and starting Docker Compose services..."
+# ─── 4. Environment file ─────────────────────────────────────────
+echo "[4/7] Checking .env file..."
 cd "$REPO_DIR"
+if [[ ! -f ".env" ]]; then
+  if [[ -f ".env.server.example" ]]; then
+    echo "  ⚠️  .env not found. Copying from .env.server.example — EDIT IT before re-running."
+    cp .env.server.example .env
+    echo "  👉  nano $REPO_DIR/.env"
+    exit 1
+  else
+    echo "  ❌ .env not found. Create it from .env.server.example."
+    exit 1
+  fi
+fi
 
-# Build frontend with production env vars
-source .env
-export VITE_API_URL="https://$DOMAIN"
+# ─── 5. Build frontend ────────────────────────────────────────────
+echo "[5/7] Building frontend..."
+cd "$REPO_DIR/frontend"
+npm ci --prefer-offline --silent
 
-docker-compose \
-  -f docker-compose.yml \
-  -f docker-compose.prod.yml \
-  build
+VITE_BASE_PATH="${SUBPATH}/" \
+VITE_API_URL="https://${DOMAIN}${SUBPATH}" \
+npm run build
 
-docker-compose \
-  -f docker-compose.yml \
-  -f docker-compose.prod.yml \
-  up -d
+mkdir -p "$STATIC_DIR"
+rm -rf "${STATIC_DIR:?}"/*
+cp -r dist/. "$STATIC_DIR/"
+echo "  Frontend copied to $STATIC_DIR"
 
-# Wait for services to be healthy
-echo "Waiting for services to start..."
-sleep 15
+# ─── 6. Docker — backend + data services ─────────────────────────
+if [[ "$SKIP_DOCKER" == false ]]; then
+  echo "[6/7] Building and starting Docker services..."
+  cd "$REPO_DIR"
 
-# Run Prisma migrations
-docker-compose exec backend npx prisma migrate deploy
-docker-compose exec backend npm run db:seed || true
+  $COMPOSE \
+    -f docker-compose.yml \
+    -f docker-compose.prod.yml \
+    -f docker-compose.server.yml \
+    up -d --build postgres chromadb redis python-service backend
 
-# ─── 8. Nginx production config ──────────────────────────────────
-echo "[8/8] Activating production Nginx config..."
+  echo "  Waiting for services to become healthy (up to 60 s)..."
+  for i in $(seq 1 12); do
+    if $COMPOSE -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.server.yml \
+         ps --filter "status=running" | grep -q kms_backend; then
+      break
+    fi
+    sleep 5
+  done
 
-# Copy frontend build into nginx html dir
-docker cp kms_frontend:/usr/share/nginx/html/. /usr/share/nginx/html/ 2>/dev/null || true
+  echo "  Running Prisma migrations..."
+  $COMPOSE \
+    -f docker-compose.yml \
+    -f docker-compose.prod.yml \
+    -f docker-compose.server.yml \
+    exec -T backend npx prisma migrate deploy
 
-sudo cp "$REPO_DIR/nginx/nginx.conf" /etc/nginx/nginx.conf
-sudo cp "$REPO_DIR/nginx/conf.d/kms.conf" /etc/nginx/conf.d/kms.conf
-sudo nginx -t && sudo systemctl restart nginx
+  $COMPOSE \
+    -f docker-compose.yml \
+    -f docker-compose.prod.yml \
+    -f docker-compose.server.yml \
+    exec -T backend npm run db:seed || true
+else
+  echo "[6/7] Skipping Docker (--skip-docker set)."
+fi
 
-# ─── Certbot auto-renewal ─────────────────────────────────────────
-echo "Setting up Certbot auto-renewal..."
-(crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx") | crontab -
+# ─── 7. Nginx config snippet ─────────────────────────────────────
+echo "[7/7] Writing Nginx location snippet..."
+
+NGINX_SNIPPET="/etc/nginx/conf.d/kms-locations.conf"
+# This file is meant to be included inside the existing 443 server block.
+# Include it manually if your nginx.conf does not already have:
+#   include /etc/nginx/conf.d/kms-locations.conf;
+cat > "$NGINX_SNIPPET" <<NGINXEOF
+# ─── KMS Frontend (static SPA) — generated by deploy.sh ─────────
+location ${SUBPATH}/ {
+    alias ${STATIC_DIR}/;
+    index index.html;
+    try_files \$uri \$uri/ ${SUBPATH}/index.html;
+}
+
+# ─── KMS API (Node.js backend on ${BACKEND_PORT}) ─────────────────
+location ${SUBPATH}/api/ {
+    client_max_body_size 60M;
+
+    proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection 'upgrade';
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_cache_bypass \$http_upgrade;
+    proxy_read_timeout 300s;
+}
+NGINXEOF
+
+echo ""
+echo "  Nginx snippet written to $NGINX_SNIPPET"
+echo ""
+echo "  ⚠️  ACTION REQUIRED — add this inside your 443 server block in"
+echo "  /etc/nginx/nginx.conf (if not already present):"
+echo ""
+echo "      include /etc/nginx/conf.d/kms-locations.conf;"
+echo ""
+
+if nginx -t 2>/dev/null; then
+  systemctl reload nginx
+  echo "  Nginx reloaded."
+else
+  echo "  ⚠️  nginx -t failed — reload Nginx manually after updating nginx.conf."
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo "  ✅ KMS Deployed Successfully!"
-echo "  🌐 URL: https://$DOMAIN"
-echo "  📊 Health: https://$DOMAIN/api/health"
+echo "  KMS Deployed Successfully!"
+echo "  URL    : https://${DOMAIN}${SUBPATH}/"
+echo "  Health : https://${DOMAIN}${SUBPATH}/api/health"
 echo "════════════════════════════════════════════════════════"
